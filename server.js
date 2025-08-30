@@ -7,10 +7,35 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const isProduction = process.env.NODE_ENV === 'production';
 
 app.use(helmet());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(cors());
+
+if (isProduction) {
+  app.set('trust proxy', 1);
+}
+
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: {
+    success: false,
+    error: 'Too many requests, please try again later.'
+  }
+});
+
+const paymentLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: {
+    success: false,
+    error: 'Too many payment requests, please try again later.'
+  }
+});
+
+app.use('/api/', generalLimiter);
 
 const requiredEnvVars = ['SQUARE_ACCESS_TOKEN', 'SQUARE_APPLICATION_ID'];
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
@@ -57,26 +82,50 @@ app.get('/api/test', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to connect to Square API',
-      details: error.message
+      details: isProduction ? 'Internal server error' : error.message
     });
   }
 });
 
-app.post('/api/payments', async (req, res) => {
+function validatePaymentInput(sourceId, amount, currency) {
+  const errors = [];
+
+  if (!sourceId || typeof sourceId !== 'string' || sourceId.trim().length === 0) {
+    errors.push('Valid sourceId is required');
+  }
+
+  if (!amount || typeof amount !== 'number') {
+    errors.push('Amount must be a number');
+  } else if (amount <= 0) {
+    errors.push('Amount must be greater than 0');
+  } else if (amount > 100000) {
+    errors.push('Amount cannot exceed $100,000');
+  } else if (!Number.isFinite(amount)) {
+    errors.push('Amount must be a valid number');
+  }
+
+  if (currency && typeof currency !== 'string') {
+    errors.push('Currency must be a string');
+  }
+
+  const validCurrencies = ['USD', 'CAD', 'EUR', 'GBP', 'JPY', 'AUD'];
+  if (currency && !validCurrencies.includes(currency.toUpperCase())) {
+    errors.push('Unsupported currency');
+  }
+
+  return errors;
+}
+
+app.post('/api/payments', paymentLimiter, async (req, res) => {
   try {
     const { sourceId, amount, currency = 'USD' } = req.body;
 
-    if (!sourceId || !amount) {
+    const validationErrors = validatePaymentInput(sourceId, amount, currency);
+    if (validationErrors.length > 0) {
       return res.status(400).json({
         success: false,
-        error: 'sourceId and amount are required'
-      });
-    }
-
-    if (typeof amount !== 'number' || amount <= 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Amount must be a positive number'
+        error: 'Validation failed',
+        details: validationErrors
       });
     }
 
@@ -84,7 +133,7 @@ app.post('/api/payments', async (req, res) => {
     const amountInCents = Math.round(amount * 100);
 
     const requestBody = {
-      sourceId,
+      sourceId: sourceId.trim(),
       amountMoney: {
         amount: BigInt(amountInCents),
         currency: currency.toUpperCase()
@@ -93,11 +142,17 @@ app.post('/api/payments', async (req, res) => {
       note: `Payment processed at ${new Date().toISOString()}`
     };
 
-    console.log(`Processing payment: $${amount} ${currency}`);
+    if (!isProduction) {
+      console.log(`Processing payment: $${amount} ${currency}`);
+    }
+
     const response = await paymentsApi.createPayment(requestBody);
 
     if (response.result && response.result.payment) {
-      console.log(`Payment successful: ${response.result.payment.id}`);
+      if (!isProduction) {
+        console.log(`Payment successful: ${response.result.payment.id}`);
+      }
+      
       res.json({
         success: true,
         paymentId: response.result.payment.id,
@@ -107,17 +162,28 @@ app.post('/api/payments', async (req, res) => {
         timestamp: new Date().toISOString()
       });
     } else {
-      console.log('Payment failed: No payment object in response');
+      if (!isProduction) {
+        console.log('Payment failed: No payment object in response');
+      }
+      
       res.status(400).json({
         success: false,
         error: 'Payment processing failed'
       });
     }
   } catch (error) {
-    console.error('Payment error:', error);
+    if (!isProduction) {
+      console.error('Payment error:', error);
+    }
 
     if (error.errors && Array.isArray(error.errors)) {
-      const errorMessages = error.errors.map(err => err.detail || err.code).join(', ');
+      const errorMessages = error.errors.map(err => {
+        if (isProduction) {
+          return err.code || 'Payment error';
+        }
+        return err.detail || err.code;
+      }).join(', ');
+      
       res.status(400).json({
         success: false,
         error: `Payment failed: ${errorMessages}`
@@ -125,14 +191,17 @@ app.post('/api/payments', async (req, res) => {
     } else {
       res.status(500).json({
         success: false,
-        error: 'Internal server error'
+        error: isProduction ? 'Payment processing error' : 'Internal server error'
       });
     }
   }
 });
 
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
+  if (!isProduction) {
+    console.error('Unhandled error:', err);
+  }
+  
   res.status(500).json({
     success: false,
     error: 'Something went wrong!'
