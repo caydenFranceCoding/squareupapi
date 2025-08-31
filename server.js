@@ -87,6 +87,29 @@ app.get('/api/test', async (req, res) => {
   }
 });
 
+app.get('/api/debug-locations', async (req, res) => {
+  try {
+    const locationsApi = squareClient.locationsApi;
+    const response = await locationsApi.listLocations();
+    
+    res.json({
+      success: true,
+      locations: response.result.locations.map(loc => ({
+        id: loc.id,
+        name: loc.name,
+        status: loc.status,
+        address: loc.address
+      }))
+    });
+  } catch (error) {
+    console.error('Location fetch error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
 function validatePaymentInput(sourceId, amount, currency) {
   const errors = [];
 
@@ -223,3 +246,4 @@ app.listen(PORT, () => {
   console.log('Payment endpoint: POST ' + 'http://localhost:' + PORT + '/api/payments');
   console.log('Ready to process payments!');
 });
+
