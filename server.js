@@ -3,36 +3,12 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { Client, Environment } = require('square');
-const { body, validationResult, param } = require('express-validator');
-const winston = require('winston');
-const compression = require('compression');
-const mongoSanitize = require('express-mongo-sanitize');
-const xss = require('xss-clean');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const isProduction = process.env.NODE_ENV === 'production';
 
-// Configure Winston logger
-const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.errors({ stack: true }),
-    winston.format.json()
-  ),
-  defaultMeta: { service: 'square-payment-backend' },
-  transports: [
-    new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
-    new winston.transports.File({ filename: 'logs/combined.log' }),
-    ...(isProduction ? [] : [new winston.transports.Console({
-      format: winston.format.simple()
-    })])
-  ]
-});
-
-// Security middleware
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -49,12 +25,8 @@ app.use(helmet({
   }
 }));
 
-app.use(compression());
 app.use(express.json({ limit: '1mb' }));
-app.use(mongoSanitize());
-app.use(xss());
 
-// CORS configuration
 const corsOptions = {
   origin: function (origin, callback) {
     const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'];
@@ -75,7 +47,6 @@ app.use(cors(corsOptions));
 if (isProduction) {
   app.set('trust proxy', 1);
   
-  // Force HTTPS in production
   app.use((req, res, next) => {
     if (req.header('x-forwarded-proto') !== 'https') {
       res.redirect(`https://${req.header('host')}${req.url}`);
@@ -85,7 +56,6 @@ if (isProduction) {
   });
 }
 
-// Enhanced rate limiting
 const createRateLimiter = (windowMs, max, message) => rateLimit({
   windowMs,
   max,
@@ -93,11 +63,7 @@ const createRateLimiter = (windowMs, max, message) => rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   handler: (req, res) => {
-    logger.warn('Rate limit exceeded', {
-      ip: req.ip,
-      userAgent: req.get('User-Agent'),
-      endpoint: req.path
-    });
+    console.warn('Rate limit exceeded:', req.ip, req.path);
     res.status(429).json({ success: false, error: message });
   }
 });
@@ -106,26 +72,17 @@ const generalLimiter = createRateLimiter(15 * 60 * 1000, 100, 'Too many requests
 const paymentLimiter = createRateLimiter(15 * 60 * 1000, 10, 'Too many payment requests');
 const configLimiter = createRateLimiter(60 * 1000, 30, 'Too many config requests');
 
-// Request logging
 app.use((req, res, next) => {
   const startTime = Date.now();
   
   res.on('finish', () => {
     const duration = Date.now() - startTime;
-    logger.info('HTTP Request', {
-      method: req.method,
-      url: req.url,
-      status: res.statusCode,
-      duration: `${duration}ms`,
-      ip: req.ip,
-      userAgent: req.get('User-Agent')
-    });
+    console.log(`${req.method} ${req.url} ${res.statusCode} ${duration}ms`);
   });
   
   next();
 });
 
-// Environment validation
 const requiredEnvVars = [
   'SQUARE_ACCESS_TOKEN',
   'SQUARE_APPLICATION_ID',
@@ -135,30 +92,25 @@ const requiredEnvVars = [
 
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
 if (missingVars.length > 0) {
-  logger.error('Missing required environment variables', { missingVars });
+  console.error('Missing required environment variables:', missingVars);
   process.exit(1);
 }
 
-// Square client initialization with error handling
 let squareClient;
 try {
   squareClient = new Client({
     accessToken: process.env.SQUARE_ACCESS_TOKEN,
     environment: process.env.SQUARE_ENVIRONMENT === 'production'
       ? Environment.Production
-      : Environment.Sandbox,
-    customUrl: process.env.SQUARE_CUSTOM_URL
+      : Environment.Sandbox
   });
   
-  logger.info('Square client initialized', {
-    environment: process.env.SQUARE_ENVIRONMENT
-  });
+  console.log('Square client initialized:', process.env.SQUARE_ENVIRONMENT);
 } catch (error) {
-  logger.error('Failed to initialize Square client', { error: error.message });
+  console.error('Failed to initialize Square client:', error.message);
   process.exit(1);
 }
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   const healthCheck = {
     status: 'OK',
@@ -171,7 +123,6 @@ app.get('/health', (req, res) => {
   res.json(healthCheck);
 });
 
-// Configuration endpoint with rate limiting
 app.get('/api/config', configLimiter, (req, res) => {
   const config = {
     applicationId: process.env.SQUARE_APPLICATION_ID,
@@ -179,46 +130,55 @@ app.get('/api/config', configLimiter, (req, res) => {
     environment: process.env.SQUARE_ENVIRONMENT || 'sandbox'
   };
   
-  logger.info('Configuration requested', { ip: req.ip });
+  console.log('Configuration requested from:', req.ip);
   res.json(config);
 });
 
-// Enhanced validation middleware
-const validatePayment = [
-  body('sourceId')
-    .isString()
-    .trim()
-    .isLength({ min: 10, max: 255 })
-    .matches(/^[a-zA-Z0-9_-]+$/)
-    .withMessage('Invalid payment source ID'),
-  
-  body('amount')
-    .isFloat({ min: 0.01, max: 100000 })
-    .withMessage('Amount must be between $0.01 and $100,000'),
-  
-  body('currency')
-    .optional()
-    .isIn(['USD', 'CAD', 'EUR', 'GBP', 'JPY', 'AUD'])
-    .withMessage('Invalid currency code'),
-  
-  body('idempotencyKey')
-    .optional()
-    .isString()
-    .isLength({ min: 1, max: 128 })
-    .matches(/^[a-zA-Z0-9_-]+$/)
-    .withMessage('Invalid idempotency key')
-];
+function validatePaymentInput(req, res, next) {
+  const { sourceId, amount, currency = 'USD' } = req.body;
+  const errors = [];
 
-// Test endpoint with Square API validation
+  if (!sourceId || typeof sourceId !== 'string' || sourceId.trim().length === 0) {
+    errors.push('Valid sourceId is required');
+  }
+
+  if (!amount || typeof amount !== 'number') {
+    errors.push('Amount must be a number');
+  } else if (amount <= 0) {
+    errors.push('Amount must be greater than 0');
+  } else if (amount > 100000) {
+    errors.push('Amount cannot exceed $100,000');
+  } else if (!Number.isFinite(amount)) {
+    errors.push('Amount must be a valid number');
+  }
+
+  if (currency && typeof currency !== 'string') {
+    errors.push('Currency must be a string');
+  }
+
+  const validCurrencies = ['USD', 'CAD', 'EUR', 'GBP', 'JPY', 'AUD'];
+  if (currency && !validCurrencies.includes(currency.toUpperCase())) {
+    errors.push('Unsupported currency');
+  }
+
+  if (errors.length > 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'Validation failed',
+      details: errors
+    });
+  }
+
+  next();
+}
+
 app.get('/api/test', generalLimiter, async (req, res) => {
   try {
     const locationsApi = squareClient.locationsApi;
     const response = await locationsApi.listLocations();
 
     if (response.result && response.result.locations) {
-      logger.info('Square API test successful', {
-        locationCount: response.result.locations.length
-      });
+      console.log('Square API test successful');
       
       res.json({
         success: true,
@@ -231,10 +191,7 @@ app.get('/api/test', generalLimiter, async (req, res) => {
       throw new Error('Invalid response from Square API');
     }
   } catch (error) {
-    logger.error('Square API test failed', {
-      error: error.message,
-      stack: error.stack
-    });
+    console.error('Square API test failed:', error.message);
     
     res.status(500).json({
       success: false,
@@ -245,36 +202,14 @@ app.get('/api/test', generalLimiter, async (req, res) => {
   }
 });
 
-// Enhanced payment processing endpoint
-app.post('/api/payments', paymentLimiter, validatePayment, async (req, res) => {
+app.post('/api/payments', paymentLimiter, validatePaymentInput, async (req, res) => {
   const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   
   try {
-    // Check validation results
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      logger.warn('Payment validation failed', {
-        requestId,
-        errors: errors.array(),
-        ip: req.ip
-      });
-      
-      return res.status(400).json({
-        success: false,
-        error: 'Validation failed',
-        details: errors.array().map(err => ({
-          field: err.path,
-          message: err.msg
-        })),
-        requestId
-      });
-    }
-
-    const { sourceId, amount, currency = 'USD', idempotencyKey } = req.body;
+    const { sourceId, amount, currency = 'USD', idempotencyKey, buyerEmail } = req.body;
     const paymentsApi = squareClient.paymentsApi;
     const amountInCents = Math.round(amount * 100);
 
-    // Generate idempotency key if not provided
     const finalIdempotencyKey = idempotencyKey || 
       `${requestId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
@@ -287,15 +222,14 @@ app.post('/api/payments', paymentLimiter, validatePayment, async (req, res) => {
       locationId: process.env.SQUARE_LOCATION_ID,
       idempotencyKey: finalIdempotencyKey,
       note: `Payment processed ${new Date().toISOString()}`,
-      buyerEmailAddress: req.body.buyerEmail || undefined
+      buyerEmailAddress: buyerEmail || undefined
     };
 
-    logger.info('Processing payment', {
+    console.log('Processing payment:', {
       requestId,
       amount,
       currency,
-      locationId: process.env.SQUARE_LOCATION_ID,
-      ip: req.ip
+      locationId: process.env.SQUARE_LOCATION_ID
     });
 
     const response = await paymentsApi.createPayment(requestBody);
@@ -303,16 +237,13 @@ app.post('/api/payments', paymentLimiter, validatePayment, async (req, res) => {
     if (response.result && response.result.payment) {
       const payment = response.result.payment;
       
-      logger.info('Payment successful', {
+      console.log('Payment successful:', {
         requestId,
         paymentId: payment.id,
         status: payment.status,
         amount,
         currency
       });
-
-      // Store payment record (implement your database logic here)
-      // await storePaymentRecord(payment, requestId);
 
       res.json({
         success: true,
@@ -324,10 +255,7 @@ app.post('/api/payments', paymentLimiter, validatePayment, async (req, res) => {
         requestId
       });
     } else {
-      logger.error('Payment failed - no payment object', {
-        requestId,
-        response: response.result
-      });
+      console.error('Payment failed - no payment object:', requestId);
       
       res.status(400).json({
         success: false,
@@ -337,10 +265,9 @@ app.post('/api/payments', paymentLimiter, validatePayment, async (req, res) => {
       });
     }
   } catch (error) {
-    logger.error('Payment processing error', {
+    console.error('Payment processing error:', {
       requestId,
       error: error.message,
-      stack: error.stack,
       squareErrors: error.errors
     });
 
@@ -370,14 +297,12 @@ app.post('/api/payments', paymentLimiter, validatePayment, async (req, res) => {
   }
 });
 
-// Global error handler
 app.use((err, req, res, next) => {
   const errorId = `err_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   
-  logger.error('Unhandled error', {
+  console.error('Unhandled error:', {
     errorId,
     error: err.message,
-    stack: err.stack,
     url: req.url,
     method: req.method,
     ip: req.ip
@@ -390,13 +315,8 @@ app.use((err, req, res, next) => {
   });
 });
 
-// 404 handler
 app.use('*', (req, res) => {
-  logger.warn('Route not found', {
-    url: req.url,
-    method: req.method,
-    ip: req.ip
-  });
+  console.warn('Route not found:', req.url, req.method, req.ip);
   
   res.status(404).json({
     success: false,
@@ -405,37 +325,33 @@ app.use('*', (req, res) => {
   });
 });
 
-// Graceful shutdown handling
 process.on('SIGTERM', () => {
-  logger.info('SIGTERM received, shutting down gracefully');
+  console.log('SIGTERM received, shutting down gracefully');
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  logger.info('SIGINT received, shutting down gracefully');
+  console.log('SIGINT received, shutting down gracefully');
   process.exit(0);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled Rejection at:', { promise, reason });
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception:', { error: error.message, stack: error.stack });
+  console.error('Uncaught Exception:', error);
   process.exit(1);
 });
 
 const server = app.listen(PORT, () => {
-  logger.info('Server started', {
-    port: PORT,
-    environment: process.env.SQUARE_ENVIRONMENT || 'sandbox',
-    nodeEnv: process.env.NODE_ENV || 'development'
-  });
+  console.log('Server started on port:', PORT);
+  console.log('Environment:', process.env.SQUARE_ENVIRONMENT || 'sandbox');
+  console.log('Node environment:', process.env.NODE_ENV || 'development');
 });
 
-// Handle server shutdown gracefully
 server.on('close', () => {
-  logger.info('Server closed');
+  console.log('Server closed');
 });
 
 module.exports = app;
