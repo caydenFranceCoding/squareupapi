@@ -206,6 +206,8 @@ app.get('/api/test', generalLimiter, async (req, res) => {
   }
 });
 
+// Replace your payment handler with this fixed version
+
 app.post('/api/payments', paymentLimiter, validatePaymentInput, async (req, res) => {
   const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   
@@ -214,8 +216,9 @@ app.post('/api/payments', paymentLimiter, validatePaymentInput, async (req, res)
     const paymentsApi = squareClient.paymentsApi;
     const amountInCents = Math.round(amount * 100);
 
+    // Generate shorter idempotency key (max 45 chars)
     const finalIdempotencyKey = idempotencyKey || 
-      `${requestId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      `${Date.now()}_${Math.random().toString(36).substr(2, 12)}`.substr(0, 45);
 
     const requestBody = {
       sourceId: sourceId.trim(),
@@ -225,7 +228,7 @@ app.post('/api/payments', paymentLimiter, validatePaymentInput, async (req, res)
       },
       locationId: process.env.SQUARE_LOCATION_ID,
       idempotencyKey: finalIdempotencyKey,
-      note: `Payment processed ${new Date().toISOString()}`,
+      note: `Payment processed ${new Date().toISOString()}`.substr(0, 60), // Square note limit is 60 chars
       buyerEmailAddress: buyerEmail || undefined
     };
 
@@ -233,7 +236,8 @@ app.post('/api/payments', paymentLimiter, validatePaymentInput, async (req, res)
       requestId,
       amount,
       currency,
-      locationId: process.env.SQUARE_LOCATION_ID
+      locationId: process.env.SQUARE_LOCATION_ID,
+      idempotencyKeyLength: finalIdempotencyKey.length
     });
 
     const response = await paymentsApi.createPayment(requestBody);
@@ -359,3 +363,4 @@ server.on('close', () => {
 });
 
 module.exports = app;
+
