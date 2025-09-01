@@ -206,7 +206,40 @@ app.get('/api/test', generalLimiter, async (req, res) => {
   }
 });
 
-// Replace your payment handler with this fixed version
+app.get('/api/debug/locations', generalLimiter, async (req, res) => {
+  try {
+    const locationsApi = squareClient.locationsApi;
+    const response = await locationsApi.listLocations();
+
+    if (response.result && response.result.locations) {
+      const locations = response.result.locations.map(location => ({
+        id: location.id,
+        name: location.name,
+        status: location.status,
+        capabilities: location.capabilities,
+        type: location.type
+      }));
+      
+      res.json({
+        success: true,
+        locations: locations,
+        currentLocationId: process.env.SQUARE_LOCATION_ID,
+        environment: process.env.SQUARE_ENVIRONMENT
+      });
+    } else {
+      res.json({
+        success: false,
+        error: 'No locations found'
+      });
+    }
+  } catch (error) {
+    res.json({
+      success: false,
+      error: error.message,
+      details: error.errors || []
+    });
+  }
+});
 
 app.post('/api/payments', paymentLimiter, validatePaymentInput, async (req, res) => {
   const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -363,4 +396,5 @@ server.on('close', () => {
 });
 
 module.exports = app;
+
 
