@@ -40,7 +40,6 @@ app.use('/api/', generalLimiter);
 const requiredEnvVars = ['SQUARE_ACCESS_TOKEN', 'SQUARE_APPLICATION_ID'];
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
 if (missingVars.length > 0) {
-  console.error('Missing required environment variables:', missingVars);
   process.exit(1);
 }
 
@@ -62,6 +61,7 @@ app.get('/health', (req, res) => {
 app.get('/api/config', (req, res) => {
   res.json({
     applicationId: process.env.SQUARE_APPLICATION_ID,
+    locationId: process.env.SQUARE_LOCATION_ID || 'L65X9J5C940J8',
     environment: process.env.SQUARE_ENVIRONMENT || 'sandbox'
   });
 });
@@ -78,34 +78,10 @@ app.get('/api/test', async (req, res) => {
       locationCount: response.result.locations ? response.result.locations.length : 0
     });
   } catch (error) {
-    console.error('Square API test error:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to connect to Square API',
       details: isProduction ? 'Internal server error' : error.message
-    });
-  }
-});
-
-app.get('/api/debug-locations', async (req, res) => {
-  try {
-    const locationsApi = squareClient.locationsApi;
-    const response = await locationsApi.listLocations();
-    
-    res.json({
-      success: true,
-      locations: response.result.locations.map(loc => ({
-        id: loc.id,
-        name: loc.name,
-        status: loc.status,
-        address: loc.address
-      }))
-    });
-  } catch (error) {
-    console.error('Location fetch error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
     });
   }
 });
@@ -161,21 +137,13 @@ app.post('/api/payments', paymentLimiter, async (req, res) => {
         amount: BigInt(amountInCents),
         currency: currency.toUpperCase()
       },
-      idempotencyKey: require('crypto').randomUUID(),
-      note: `Payment processed at ${new Date().toISOString()}`
+      locationId: process.env.SQUARE_LOCATION_ID || 'L65X9J5C940J8',
+      idempotencyKey: require('crypto').randomUUID()
     };
-
-    if (!isProduction) {
-      console.log(`Processing payment: $${amount} ${currency}`);
-    }
 
     const response = await paymentsApi.createPayment(requestBody);
 
     if (response.result && response.result.payment) {
-      if (!isProduction) {
-        console.log(`Payment successful: ${response.result.payment.id}`);
-      }
-      
       res.json({
         success: true,
         paymentId: response.result.payment.id,
@@ -185,20 +153,12 @@ app.post('/api/payments', paymentLimiter, async (req, res) => {
         timestamp: new Date().toISOString()
       });
     } else {
-      if (!isProduction) {
-        console.log('Payment failed: No payment object in response');
-      }
-      
       res.status(400).json({
         success: false,
         error: 'Payment processing failed'
       });
     }
   } catch (error) {
-    if (!isProduction) {
-      console.error('Payment error:', error);
-    }
-
     if (error.errors && Array.isArray(error.errors)) {
       const errorMessages = error.errors.map(err => {
         if (isProduction) {
@@ -221,10 +181,6 @@ app.post('/api/payments', paymentLimiter, async (req, res) => {
 });
 
 app.use((err, req, res, next) => {
-  if (!isProduction) {
-    console.error('Unhandled error:', err);
-  }
-  
   res.status(500).json({
     success: false,
     error: 'Something went wrong!'
@@ -241,9 +197,5 @@ app.use('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log('Server running on http://localhost:' + PORT);
-  console.log('Health check: http://localhost:' + PORT + '/health');
   console.log('Environment: ' + (process.env.SQUARE_ENVIRONMENT || 'sandbox'));
-  console.log('Payment endpoint: POST ' + 'http://localhost:' + PORT + '/api/payments');
-  console.log('Ready to process payments!');
 });
-
