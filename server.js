@@ -9,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const isProduction = process.env.NODE_ENV === 'production';
 
-// Enhanced transaction tracking for production
+// Updated transaction tracking with more realistic limits
 let transactionMetrics = {
   dailyCount: 0,
   hourlyCount: 0,
@@ -20,13 +20,24 @@ let transactionMetrics = {
   limitResetTime: null
 };
 
-// Production limits (these are typical Square production limits - adjust based on your account)
+// More realistic production limits (adjust based on your actual Square account limits)
 const PRODUCTION_LIMITS = {
-  dailyTransactions: 10000,  // Typical production daily limit
-  hourlyTransactions: 1000,  // Typical production hourly limit
-  monthlyVolume: 1000000,    // $1M monthly volume limit for some accounts
-  perTransactionMax: 25000   // $250 max per transaction for some accounts
+  dailyTransactions: 50000,     // Increased from 10000
+  hourlyTransactions: 5000,     // Increased from 1000
+  monthlyVolume: 10000000,      // $10M monthly volume
+  perTransactionMax: 50000      // $500 max per transaction
 };
+
+// For development/testing, use much higher limits or disable
+const DEVELOPMENT_LIMITS = {
+  dailyTransactions: 100000,
+  hourlyTransactions: 10000,
+  monthlyVolume: 100000000,
+  perTransactionMax: 100000
+};
+
+// Choose limits based on environment
+const LIMITS = isProduction ? PRODUCTION_LIMITS : DEVELOPMENT_LIMITS;
 
 // Enhanced security headers for production
 app.use(helmet({
@@ -58,10 +69,13 @@ const corsOptions = {
       'https://vibebeads.onrender.com',
       'https://vibebeads.net',
       'https://www.vibebeads.net',
-      'http://localhost:3000' // Remove this in production
+      'http://localhost:3000' // Keep for development
     ];
     
-    if (!origin || allowedOrigins.includes(origin)) {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
       console.warn('CORS blocked origin:', origin);
@@ -89,7 +103,7 @@ if (isProduction) {
   });
 }
 
-// Enhanced rate limiting for production
+// More lenient rate limiting
 const createRateLimiter = (windowMs, max, message, skipSuccessfulRequests = false) => rateLimit({
   windowMs,
   max,
@@ -111,10 +125,10 @@ const createRateLimiter = (windowMs, max, message, skipSuccessfulRequests = fals
   }
 });
 
-// Production rate limiters
-const generalLimiter = createRateLimiter(15 * 60 * 1000, 200, 'Too many requests', true);
-const paymentLimiter = createRateLimiter(15 * 60 * 1000, 50, 'Too many payment requests');
-const configLimiter = createRateLimiter(60 * 1000, 60, 'Too many config requests', true);
+// Updated rate limiters - more lenient
+const generalLimiter = createRateLimiter(15 * 60 * 1000, 500, 'Too many requests', true);
+const paymentLimiter = createRateLimiter(15 * 60 * 1000, 100, 'Too many payment requests'); // Increased from 50
+const configLimiter = createRateLimiter(60 * 1000, 120, 'Too many config requests', true);
 
 // Enhanced logging middleware
 app.use((req, res, next) => {
@@ -138,8 +152,8 @@ app.use((req, res, next) => {
     
     if (res.statusCode >= 400) {
       console.warn('Request warning/error:', logData);
-    } else {
-      console.log('Request completed:', logData);
+    } else if (req.url.includes('/payments')) {
+      console.log('Payment request completed:', logData);
     }
   });
   
@@ -176,6 +190,7 @@ try {
   console.log('Square client initialized:', {
     environment: process.env.SQUARE_ENVIRONMENT,
     locationId: process.env.SQUARE_LOCATION_ID,
+    limitsActive: isProduction ? 'Production limits' : 'Development limits',
     timestamp: new Date().toISOString()
   });
 } catch (error) {
@@ -183,7 +198,7 @@ try {
   process.exit(1);
 }
 
-// Reset transaction counters
+// Reset transaction counters with better logic
 function resetTransactionCounters() {
   const now = new Date();
   const currentHour = now.getHours();
@@ -193,6 +208,14 @@ function resetTransactionCounters() {
   if (currentHour !== transactionMetrics.lastHourlyReset) {
     transactionMetrics.hourlyCount = 0;
     transactionMetrics.lastHourlyReset = currentHour;
+    
+    // Clear hourly limits when resetting
+    if (transactionMetrics.limitType === 'hourly') {
+      transactionMetrics.limitReached = false;
+      transactionMetrics.limitType = null;
+      transactionMetrics.limitResetTime = null;
+    }
+    
     console.log('Hourly transaction counter reset');
   }
   
@@ -200,37 +223,53 @@ function resetTransactionCounters() {
   if (currentDate !== transactionMetrics.lastDailyReset) {
     transactionMetrics.dailyCount = 0;
     transactionMetrics.lastDailyReset = currentDate;
+    
+    // Clear all limits when resetting daily
     transactionMetrics.limitReached = false;
     transactionMetrics.limitType = null;
     transactionMetrics.limitResetTime = null;
+    
     console.log('Daily transaction counter reset');
   }
 }
 
-// Check if we've hit transaction limits
+// Updated limit checking with more lenient approach
 function checkTransactionLimits() {
   resetTransactionCounters();
   
-  if (transactionMetrics.dailyCount >= PRODUCTION_LIMITS.dailyTransactions) {
+  // In development, be much more lenient or skip limits entirely
+  if (!isProduction) {
+    console.log('Development mode - transaction limits relaxed');
+    return { limited: false };
+  }
+  
+  if (transactionMetrics.dailyCount >= LIMITS.dailyTransactions) {
     transactionMetrics.limitReached = true;
     transactionMetrics.limitType = 'daily';
-    transactionMetrics.limitResetTime = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+    transactionMetrics.limitResetTime = tomorrow;
+    
     return { 
       limited: true, 
       type: 'daily', 
-      message: 'Daily transaction limit reached',
+      message: `Daily transaction limit of ${LIMITS.dailyTransactions} reached`,
       resetTime: transactionMetrics.limitResetTime
     };
   }
   
-  if (transactionMetrics.hourlyCount >= PRODUCTION_LIMITS.hourlyTransactions) {
+  if (transactionMetrics.hourlyCount >= LIMITS.hourlyTransactions) {
     transactionMetrics.limitReached = true;
     transactionMetrics.limitType = 'hourly';
-    transactionMetrics.limitResetTime = new Date(Date.now() + 60 * 60 * 1000);
+    const nextHour = new Date();
+    nextHour.setHours(nextHour.getHours() + 1, 0, 0, 0);
+    transactionMetrics.limitResetTime = nextHour;
+    
     return { 
       limited: true, 
       type: 'hourly', 
-      message: 'Hourly transaction limit reached',
+      message: `Hourly transaction limit of ${LIMITS.hourlyTransactions} reached`,
       resetTime: transactionMetrics.limitResetTime
     };
   }
@@ -240,6 +279,8 @@ function checkTransactionLimits() {
 
 // Enhanced health check
 app.get('/health', (req, res) => {
+  resetTransactionCounters();
+  
   const healthCheck = {
     status: 'OK',
     timestamp: new Date().toISOString(),
@@ -250,7 +291,8 @@ app.get('/health', (req, res) => {
       dailyCount: transactionMetrics.dailyCount,
       hourlyCount: transactionMetrics.hourlyCount,
       limitReached: transactionMetrics.limitReached,
-      limitType: transactionMetrics.limitType
+      limitType: transactionMetrics.limitType,
+      limits: LIMITS
     },
     memory: {
       used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
@@ -263,6 +305,7 @@ app.get('/health', (req, res) => {
 
 // Enhanced configuration endpoint
 app.get('/api/config', configLimiter, (req, res) => {
+  resetTransactionCounters();
   const limitCheck = checkTransactionLimits();
   
   const config = {
@@ -272,14 +315,22 @@ app.get('/api/config', configLimiter, (req, res) => {
     limits: {
       transactionLimitReached: limitCheck.limited,
       limitType: limitCheck.type,
-      resetTime: limitCheck.resetTime
+      resetTime: limitCheck.resetTime,
+      dailyCount: transactionMetrics.dailyCount,
+      hourlyCount: transactionMetrics.hourlyCount,
+      maxDailyTransactions: LIMITS.dailyTransactions,
+      maxHourlyTransactions: LIMITS.hourlyTransactions
     }
   };
   
   console.log('Configuration requested:', {
     ip: req.ip,
     requestId: req.requestId,
-    limitStatus: limitCheck
+    limitStatus: limitCheck,
+    counters: {
+      daily: transactionMetrics.dailyCount,
+      hourly: transactionMetrics.hourlyCount
+    }
   });
   
   res.json(config);
@@ -298,8 +349,8 @@ function validatePaymentInput(req, res, next) {
     errors.push('Amount must be a number');
   } else if (amount <= 0) {
     errors.push('Amount must be greater than 0');
-  } else if (amount > PRODUCTION_LIMITS.perTransactionMax) {
-    errors.push(`Amount cannot exceed $${PRODUCTION_LIMITS.perTransactionMax.toLocaleString()}`);
+  } else if (amount > LIMITS.perTransactionMax) {
+    errors.push(`Amount cannot exceed $${LIMITS.perTransactionMax.toLocaleString()}`);
   } else if (!Number.isFinite(amount)) {
     errors.push('Amount must be a valid number');
   }
@@ -376,23 +427,27 @@ app.get('/api/test', generalLimiter, async (req, res) => {
   }
 });
 
-// Enhanced payment processing endpoint
+// Enhanced payment processing endpoint with better error handling
 app.post('/api/payments', paymentLimiter, validatePaymentInput, async (req, res) => {
   const requestId = req.requestId;
   
   try {
-    // Check transaction limits before processing
+    // Check transaction limits before processing - but be more lenient
     const limitCheck = checkTransactionLimits();
     if (limitCheck.limited) {
       console.warn('Transaction limit reached:', {
         requestId,
         limitType: limitCheck.type,
-        resetTime: limitCheck.resetTime
+        resetTime: limitCheck.resetTime,
+        counters: {
+          daily: transactionMetrics.dailyCount,
+          hourly: transactionMetrics.hourlyCount
+        }
       });
       
       return res.status(429).json({
         success: false,
-        error: 'Authorization error: \'TRANSACTION_LIMIT\'',
+        error: 'Transaction limit temporarily reached',
         details: [{
           code: 'TRANSACTION_LIMIT',
           category: 'RATE_LIMIT_ERROR',
@@ -455,7 +510,11 @@ app.post('/api/payments', paymentLimiter, validatePaymentInput, async (req, res)
       locationId: process.env.SQUARE_LOCATION_ID,
       idempotencyKeyLength: finalIdempotencyKey.length,
       hasBillingAddress: !!billingAddress,
-      hasOrderDescription: !!orderDescription
+      hasOrderDescription: !!orderDescription,
+      counters: {
+        daily: transactionMetrics.dailyCount,
+        hourly: transactionMetrics.hourlyCount
+      }
     });
 
     const response = await paymentsApi.createPayment(requestBody);
@@ -473,8 +532,10 @@ app.post('/api/payments', paymentLimiter, validatePaymentInput, async (req, res)
         status: payment.status,
         amount,
         currency,
-        dailyCount: transactionMetrics.dailyCount,
-        hourlyCount: transactionMetrics.hourlyCount
+        newCounters: {
+          daily: transactionMetrics.dailyCount,
+          hourly: transactionMetrics.hourlyCount
+        }
       });
 
       res.json({
@@ -517,31 +578,31 @@ app.post('/api/payments', paymentLimiter, validatePaymentInput, async (req, res)
         field: err.field
       }));
       
-      // Check for transaction limit errors in Square response
-      const hasTransactionLimitError = error.errors.some(err => 
-        err.code?.includes('TRANSACTION_LIMIT') ||
+      // Check for Square API rate limit errors (not our internal limits)
+      const hasSquareRateLimit = error.errors.some(err => 
         err.code?.includes('RATE_LIMIT') ||
         err.category === 'RATE_LIMIT_ERROR' ||
-        err.detail?.toLowerCase().includes('limit')
+        (err.detail?.toLowerCase().includes('rate') && err.detail?.toLowerCase().includes('limit'))
       );
       
-      if (hasTransactionLimitError) {
-        // Mark our internal limit as reached
-        transactionMetrics.limitReached = true;
-        transactionMetrics.limitType = 'square_api';
-        transactionMetrics.limitResetTime = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
-        
-        console.error('Square API transaction limit reached:', {
+      if (hasSquareRateLimit) {
+        console.error('Square API rate limit reached (from Square):', {
           requestId,
           errorDetails
         });
+        
+        return res.status(429).json({
+          success: false,
+          error: 'Square API rate limit reached',
+          details: errorDetails,
+          message: 'Payment processing temporarily limited by Square. Please try again in a few minutes.',
+          requestId
+        });
       }
       
-      const statusCode = hasTransactionLimitError ? 429 : 400;
-      
-      res.status(statusCode).json({
+      res.status(400).json({
         success: false,
-        error: hasTransactionLimitError ? 'Authorization error: \'TRANSACTION_LIMIT\'' : 'Payment failed',
+        error: 'Payment failed',
         details: errorDetails,
         message: error.errors.map(e => e.detail || e.code).join(', '),
         requestId
@@ -570,9 +631,43 @@ app.get('/api/metrics', generalLimiter, (req, res) => {
     success: true,
     metrics: {
       ...transactionMetrics,
-      limits: PRODUCTION_LIMITS,
+      limits: LIMITS,
+      environment: isProduction ? 'production' : 'development',
       timestamp: new Date().toISOString()
     },
+    requestId: req.requestId
+  });
+});
+
+// Reset limits endpoint (for development/testing)
+app.post('/api/reset-limits', (req, res) => {
+  if (isProduction) {
+    return res.status(403).json({
+      success: false,
+      error: 'Reset not allowed in production',
+      requestId: req.requestId
+    });
+  }
+  
+  // Reset all counters and limits
+  transactionMetrics = {
+    dailyCount: 0,
+    hourlyCount: 0,
+    lastHourlyReset: new Date().getHours(),
+    lastDailyReset: new Date().toDateString(),
+    limitReached: false,
+    limitType: null,
+    limitResetTime: null
+  };
+  
+  console.log('Transaction limits reset:', {
+    requestId: req.requestId,
+    timestamp: new Date().toISOString()
+  });
+  
+  res.json({
+    success: true,
+    message: 'Transaction limits reset',
     requestId: req.requestId
   });
 });
@@ -602,13 +697,6 @@ app.use((err, req, res, next) => {
 
 // 404 handler
 app.use('*', (req, res) => {
-  console.warn('Route not found:', {
-    url: req.url,
-    method: req.method,
-    ip: req.ip,
-    requestId: req.requestId
-  });
-  
   res.status(404).json({
     success: false,
     error: 'Route not found',
@@ -653,10 +741,11 @@ process.on('uncaughtException', (error) => {
 
 // Start server
 const server = app.listen(PORT, () => {
-  console.log('Production server started:', {
+  console.log('Server started:', {
     port: PORT,
     environment: process.env.SQUARE_ENVIRONMENT || 'sandbox',
     nodeEnv: process.env.NODE_ENV || 'development',
+    limits: isProduction ? 'Production limits active' : 'Development limits (relaxed)',
     timestamp: new Date().toISOString()
   });
 });
