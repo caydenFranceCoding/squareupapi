@@ -2,14 +2,50 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { Client, Environment } = require('square');
+const crypto = require('crypto');
+const stripe = require('stripe');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const isProduction = process.env.NODE_ENV === 'production';
 
-// Updated transaction tracking with more realistic limits
+// Validate required environment variables
+const requiredEnvVars = [
+  'STRIPE_SECRET_KEY',
+  'STRIPE_PUBLISHABLE_KEY',
+  'STRIPE_WEBHOOK_SECRET'
+];
+
+const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+if (missingVars.length > 0) {
+  console.error('CRITICAL: Missing required environment variables:', missingVars);
+  console.error('Required variables: STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, STRIPE_WEBHOOK_SECRET, ALLOWED_ORIGINS');
+  process.exit(1);
+}
+
+// Initialize Stripe with error handling
+let stripeClient;
+try {
+  stripeClient = stripe(process.env.STRIPE_SECRET_KEY, {
+    apiVersion: '2023-10-16',
+    timeout: 20000, // 20 second timeout
+    maxNetworkRetries: 3,
+    telemetry: false, // Disable telemetry for security
+    appInfo: {
+      name: 'VibeBeads Payment System',
+      version: '1.0.0',
+      url: process.env.ALLOWED_ORIGINS?.split(',')[0] || 'https://vibebeads.net'
+    }
+  });
+  
+  console.log('✅ Stripe client initialized successfully');
+} catch (error) {
+  console.error('❌ Failed to initialize Stripe client:', error.message);
+  process.exit(1);
+}
+
+// Transaction tracking for monitoring and rate limiting
 let transactionMetrics = {
   dailyCount: 0,
   hourlyCount: 0,
@@ -17,37 +53,44 @@ let transactionMetrics = {
   lastDailyReset: new Date().toDateString(),
   limitReached: false,
   limitType: null,
-  limitResetTime: null
+  limitResetTime: null,
+  dailyVolume: 0,
+  monthlyVolume: 0,
+  lastMonthlyReset: new Date().getMonth()
 };
 
-// More realistic production limits (adjust based on your actual Square account limits)
+// Production limits (adjust based on your Stripe account limits)
 const PRODUCTION_LIMITS = {
-  dailyTransactions: 50000,     // Increased from 10000
-  hourlyTransactions: 5000,     // Increased from 1000
-  monthlyVolume: 10000000,      // $10M monthly volume
-  perTransactionMax: 50000      // $500 max per transaction
+  dailyTransactions: 10000,
+  hourlyTransactions: 1000,
+  dailyVolume: 1000000, // $10,000 daily volume
+  monthlyVolume: 10000000, // $100,000 monthly volume
+  perTransactionMax: 100000, // $1,000 max per transaction
+  perTransactionMin: 50 // $0.50 minimum
 };
 
-// For development/testing, use much higher limits or disable
 const DEVELOPMENT_LIMITS = {
   dailyTransactions: 100000,
   hourlyTransactions: 10000,
-  monthlyVolume: 100000000,
-  perTransactionMax: 100000
+  dailyVolume: 100000000,
+  monthlyVolume: 1000000000,
+  perTransactionMax: 100000,
+  perTransactionMin: 50
 };
 
-// Choose limits based on environment
 const LIMITS = isProduction ? PRODUCTION_LIMITS : DEVELOPMENT_LIMITS;
 
-// Enhanced security headers for production
+// Security middleware with production-grade settings
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'"],
-      imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'", "https://connect.squareup.com", "https://pci-connect.squareup.com"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com"],
+      scriptSrc: ["'self'", "https://js.stripe.com"],
+      frameSrc: ["'self'", "https://js.stripe.com", "https://checkout.stripe.com"],
+      imgSrc: ["'self'", "data:", "https:", "https://*.stripe.com"],
+      connectSrc: ["'self'", "https://api.stripe.com", "https://checkout.stripe.com"],
     },
   },
   hsts: {
@@ -57,85 +100,94 @@ app.use(helmet({
   },
   noSniff: true,
   xssFilter: true,
-  referrerPolicy: { policy: "same-origin" }
+  referrerPolicy: { policy: "strict-origin-when-cross-origin" },
+  crossOriginEmbedderPolicy: false // Required for Stripe
 }));
 
+// Body parsing with size limits
+app.use('/api/webhook', express.raw({ type: 'application/json', limit: '1mb' }));
 app.use(express.json({ limit: '1mb' }));
 
-// Enhanced CORS for production
+// Production CORS configuration
 const corsOptions = {
   origin: function (origin, callback) {
-    const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [
-      'https://vibebeads.onrender.com',
-      'https://vibebeads.net',
-      'https://www.vibebeads.net',
-      'http://localhost:3000' // Keep for development
-    ];
+    const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()) || [];
     
-    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!isProduction) {
+      allowedOrigins.push('http://localhost:3000', 'http://localhost:3001');
+    }
+    
+    // Allow requests with no origin (mobile apps, server-to-server)
     if (!origin) return callback(null, true);
     
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      console.warn('CORS blocked origin:', origin);
-      callback(new Error('Not allowed by CORS'));
+      console.warn('🚨 CORS violation:', { origin, allowed: allowedOrigins, timestamp: new Date().toISOString() });
+      callback(new Error('Access denied by CORS policy'));
     }
   },
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  maxAge: 86400
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'stripe-signature'],
+  maxAge: 86400,
+  optionsSuccessStatus: 200
 };
 
 app.use(cors(corsOptions));
 
-// Production HTTPS enforcement
+// HTTPS enforcement for production
 if (isProduction) {
   app.set('trust proxy', 1);
   
   app.use((req, res, next) => {
-    if (req.header('x-forwarded-proto') !== 'https') {
-      res.redirect(`https://${req.header('host')}${req.url}`);
-    } else {
-      next();
+    if (req.header('x-forwarded-proto') !== 'https' && !req.url.startsWith('/health')) {
+      return res.redirect(301, `https://${req.header('host')}${req.url}`);
     }
+    next();
   });
 }
 
-// More lenient rate limiting
-const createRateLimiter = (windowMs, max, message, skipSuccessfulRequests = false) => rateLimit({
+// Advanced rate limiting with different tiers
+const createRateLimiter = (windowMs, max, message, keyGenerator = null, skipSuccessfulRequests = false) => rateLimit({
   windowMs,
   max,
-  message: { success: false, error: message },
+  message: { success: false, error: message, code: 'RATE_LIMIT_EXCEEDED' },
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests,
-  handler: (req, res) => {
-    console.warn('Rate limit exceeded:', {
+  keyGenerator: keyGenerator || ((req) => `${req.ip}:${req.path}`),
+  handler: (req, res, next) => {
+    console.warn('⚠️ Rate limit exceeded:', {
       ip: req.ip,
       path: req.path,
-      timestamp: new Date().toISOString()
+      userAgent: req.get('User-Agent'),
+      timestamp: new Date().toISOString(),
+      requestId: req.requestId
     });
     res.status(429).json({ 
       success: false, 
       error: message,
-      retryAfter: Math.ceil(windowMs / 1000)
+      code: 'RATE_LIMIT_EXCEEDED',
+      retryAfter: Math.ceil(windowMs / 1000),
+      requestId: req.requestId
     });
   }
 });
 
-// Updated rate limiters - more lenient
-const generalLimiter = createRateLimiter(15 * 60 * 1000, 500, 'Too many requests', true);
-const paymentLimiter = createRateLimiter(15 * 60 * 1000, 100, 'Too many payment requests'); // Increased from 50
-const configLimiter = createRateLimiter(60 * 1000, 120, 'Too many config requests', true);
+// Multi-tier rate limiting
+const globalLimiter = createRateLimiter(15 * 60 * 1000, 1000, 'Too many requests from this IP', null, true);
+const checkoutLimiter = createRateLimiter(15 * 60 * 1000, 100, 'Too many checkout requests');
+const webhookLimiter = createRateLimiter(60 * 1000, 200, 'Webhook rate limit exceeded');
+const configLimiter = createRateLimiter(60 * 1000, 300, 'Too many config requests', null, true);
 
-// Enhanced logging middleware
+// Request tracking middleware
 app.use((req, res, next) => {
   const startTime = Date.now();
-  const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const requestId = `req_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
   
   req.requestId = requestId;
+  req.startTime = startTime;
   
   res.on('finish', () => {
     const duration = Date.now() - startTime;
@@ -146,138 +198,141 @@ app.use((req, res, next) => {
       status: res.statusCode,
       duration: `${duration}ms`,
       ip: req.ip,
-      userAgent: req.get('User-Agent'),
+      userAgent: req.get('User-Agent')?.substring(0, 100),
       timestamp: new Date().toISOString()
     };
     
-    if (res.statusCode >= 400) {
-      console.warn('Request warning/error:', logData);
-    } else if (req.url.includes('/payments')) {
-      console.log('Payment request completed:', logData);
+    if (res.statusCode >= 500) {
+      console.error('🔥 Server error:', logData);
+    } else if (res.statusCode >= 400) {
+      console.warn('⚠️ Client error:', logData);
+    } else if (req.url.includes('/checkout') || req.url.includes('/webhook')) {
+      console.log('💳 Payment operation:', logData);
     }
   });
   
   next();
 });
 
-// Validate required environment variables
-const requiredEnvVars = [
-  'SQUARE_ACCESS_TOKEN',
-  'SQUARE_APPLICATION_ID',
-  'SQUARE_LOCATION_ID',
-  'SQUARE_ENVIRONMENT'
-];
+// Global limiter applied to all routes
+app.use(globalLimiter);
 
-const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
-if (missingVars.length > 0) {
-  console.error('Missing required environment variables:', missingVars);
-  process.exit(1);
-}
-
-// Initialize Square client with enhanced error handling
-let squareClient;
-try {
-  squareClient = new Client({
-    accessToken: process.env.SQUARE_ACCESS_TOKEN,
-    environment: process.env.SQUARE_ENVIRONMENT === 'production'
-      ? Environment.Production
-      : Environment.Sandbox,
-    customUrl: process.env.SQUARE_ENVIRONMENT === 'production' 
-      ? 'https://connect.squareup.com'
-      : 'https://connect.squareupsandbox.com'
-  });
-  
-  console.log('Square client initialized:', {
-    environment: process.env.SQUARE_ENVIRONMENT,
-    locationId: process.env.SQUARE_LOCATION_ID,
-    limitsActive: isProduction ? 'Production limits' : 'Development limits',
-    timestamp: new Date().toISOString()
-  });
-} catch (error) {
-  console.error('Failed to initialize Square client:', error.message);
-  process.exit(1);
-}
-
-// Reset transaction counters with better logic
+// Reset transaction counters with comprehensive logic
 function resetTransactionCounters() {
   const now = new Date();
   const currentHour = now.getHours();
   const currentDate = now.toDateString();
+  const currentMonth = now.getMonth();
   
   // Reset hourly counter
   if (currentHour !== transactionMetrics.lastHourlyReset) {
     transactionMetrics.hourlyCount = 0;
     transactionMetrics.lastHourlyReset = currentHour;
     
-    // Clear hourly limits when resetting
     if (transactionMetrics.limitType === 'hourly') {
       transactionMetrics.limitReached = false;
       transactionMetrics.limitType = null;
       transactionMetrics.limitResetTime = null;
     }
-    
-    console.log('Hourly transaction counter reset');
   }
   
-  // Reset daily counter
+  // Reset daily counter and volume
   if (currentDate !== transactionMetrics.lastDailyReset) {
     transactionMetrics.dailyCount = 0;
+    transactionMetrics.dailyVolume = 0;
     transactionMetrics.lastDailyReset = currentDate;
     
-    // Clear all limits when resetting daily
-    transactionMetrics.limitReached = false;
-    transactionMetrics.limitType = null;
-    transactionMetrics.limitResetTime = null;
+    if (transactionMetrics.limitType === 'daily') {
+      transactionMetrics.limitReached = false;
+      transactionMetrics.limitType = null;
+      transactionMetrics.limitResetTime = null;
+    }
     
-    console.log('Daily transaction counter reset');
+    console.log('📊 Daily metrics reset');
+  }
+  
+  // Reset monthly volume
+  if (currentMonth !== transactionMetrics.lastMonthlyReset) {
+    transactionMetrics.monthlyVolume = 0;
+    transactionMetrics.lastMonthlyReset = currentMonth;
+    
+    if (transactionMetrics.limitType === 'monthly') {
+      transactionMetrics.limitReached = false;
+      transactionMetrics.limitType = null;
+      transactionMetrics.limitResetTime = null;
+    }
+    
+    console.log('📊 Monthly metrics reset');
   }
 }
 
-// Updated limit checking with more lenient approach
-function checkTransactionLimits() {
+// Comprehensive limit checking
+function checkTransactionLimits(amount = 0) {
   resetTransactionCounters();
   
-  // In development, be much more lenient or skip limits entirely
+  // More lenient in development
   if (!isProduction) {
-    console.log('Development mode - transaction limits relaxed');
     return { limited: false };
   }
   
+  // Check transaction count limits
   if (transactionMetrics.dailyCount >= LIMITS.dailyTransactions) {
-    transactionMetrics.limitReached = true;
-    transactionMetrics.limitType = 'daily';
     const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);
     tomorrow.setHours(0, 0, 0, 0);
-    transactionMetrics.limitResetTime = tomorrow;
     
     return { 
       limited: true, 
-      type: 'daily', 
-      message: `Daily transaction limit of ${LIMITS.dailyTransactions} reached`,
-      resetTime: transactionMetrics.limitResetTime
+      type: 'daily_count', 
+      message: `Daily transaction limit of ${LIMITS.dailyTransactions.toLocaleString()} reached`,
+      resetTime: tomorrow
     };
   }
   
   if (transactionMetrics.hourlyCount >= LIMITS.hourlyTransactions) {
-    transactionMetrics.limitReached = true;
-    transactionMetrics.limitType = 'hourly';
     const nextHour = new Date();
     nextHour.setHours(nextHour.getHours() + 1, 0, 0, 0);
-    transactionMetrics.limitResetTime = nextHour;
     
     return { 
       limited: true, 
-      type: 'hourly', 
-      message: `Hourly transaction limit of ${LIMITS.hourlyTransactions} reached`,
-      resetTime: transactionMetrics.limitResetTime
+      type: 'hourly_count', 
+      message: `Hourly transaction limit of ${LIMITS.hourlyTransactions.toLocaleString()} reached`,
+      resetTime: nextHour
+    };
+  }
+  
+  // Check volume limits
+  const amountInDollars = amount / 100;
+  if ((transactionMetrics.dailyVolume + amountInDollars) > LIMITS.dailyVolume) {
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+    
+    return { 
+      limited: true, 
+      type: 'daily_volume', 
+      message: `Daily volume limit of $${LIMITS.dailyVolume.toLocaleString()} would be exceeded`,
+      resetTime: tomorrow
+    };
+  }
+  
+  if ((transactionMetrics.monthlyVolume + amountInDollars) > LIMITS.monthlyVolume) {
+    const nextMonth = new Date();
+    nextMonth.setMonth(nextMonth.getMonth() + 1, 1);
+    nextMonth.setHours(0, 0, 0, 0);
+    
+    return { 
+      limited: true, 
+      type: 'monthly_volume', 
+      message: `Monthly volume limit of $${LIMITS.monthlyVolume.toLocaleString()} would be exceeded`,
+      resetTime: nextMonth
     };
   }
   
   return { limited: false };
 }
 
-// Enhanced health check
+// Health check endpoint
 app.get('/health', (req, res) => {
   resetTransactionCounters();
   
@@ -285,14 +340,24 @@ app.get('/health', (req, res) => {
     status: 'OK',
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()),
-    environment: process.env.SQUARE_ENVIRONMENT || 'sandbox',
+    environment: isProduction ? 'production' : 'development',
     version: process.env.npm_package_version || '1.0.0',
-    transactionMetrics: {
-      dailyCount: transactionMetrics.dailyCount,
-      hourlyCount: transactionMetrics.hourlyCount,
-      limitReached: transactionMetrics.limitReached,
-      limitType: transactionMetrics.limitType,
-      limits: LIMITS
+    stripe: {
+      connected: !!stripeClient,
+      apiVersion: '2023-10-16'
+    },
+    metrics: {
+      daily: {
+        transactions: transactionMetrics.dailyCount,
+        volume: `$${transactionMetrics.dailyVolume.toLocaleString()}`
+      },
+      hourly: {
+        transactions: transactionMetrics.hourlyCount
+      },
+      limits: {
+        reached: transactionMetrics.limitReached,
+        type: transactionMetrics.limitType
+      }
     },
     memory: {
       used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
@@ -303,72 +368,84 @@ app.get('/health', (req, res) => {
   res.json(healthCheck);
 });
 
-// Enhanced configuration endpoint
+// Configuration endpoint
 app.get('/api/config', configLimiter, (req, res) => {
   resetTransactionCounters();
   const limitCheck = checkTransactionLimits();
   
   const config = {
-    applicationId: process.env.SQUARE_APPLICATION_ID,
-    locationId: process.env.SQUARE_LOCATION_ID,
-    environment: process.env.SQUARE_ENVIRONMENT || 'sandbox',
+    publishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
+    environment: isProduction ? 'production' : 'development',
     limits: {
       transactionLimitReached: limitCheck.limited,
       limitType: limitCheck.type,
       resetTime: limitCheck.resetTime,
-      dailyCount: transactionMetrics.dailyCount,
-      hourlyCount: transactionMetrics.hourlyCount,
-      maxDailyTransactions: LIMITS.dailyTransactions,
-      maxHourlyTransactions: LIMITS.hourlyTransactions
+      maxAmount: LIMITS.perTransactionMax,
+      minAmount: LIMITS.perTransactionMin,
+      dailyTransactions: transactionMetrics.dailyCount,
+      maxDailyTransactions: LIMITS.dailyTransactions
+    },
+    features: {
+      applePay: true,
+      googlePay: true,
+      cards: true,
+      bankTransfers: false // Configure based on your needs
     }
   };
-  
-  console.log('Configuration requested:', {
-    ip: req.ip,
-    requestId: req.requestId,
-    limitStatus: limitCheck,
-    counters: {
-      daily: transactionMetrics.dailyCount,
-      hourly: transactionMetrics.hourlyCount
-    }
-  });
   
   res.json(config);
 });
 
-// Enhanced input validation
-function validatePaymentInput(req, res, next) {
-  const { sourceId, amount, currency = 'USD', idempotencyKey } = req.body;
+// Input validation middleware
+function validateCheckoutInput(req, res, next) {
+  const { 
+    amount, 
+    currency = 'USD', 
+    successUrl, 
+    cancelUrl,
+    customerEmail,
+    lineItems,
+    mode = 'payment'
+  } = req.body;
+  
   const errors = [];
-
-  if (!sourceId || typeof sourceId !== 'string' || sourceId.trim().length === 0) {
-    errors.push('Valid sourceId is required');
-  }
-
+  
+  // Validate amount
   if (!amount || typeof amount !== 'number') {
     errors.push('Amount must be a number');
-  } else if (amount <= 0) {
-    errors.push('Amount must be greater than 0');
+  } else if (amount < LIMITS.perTransactionMin) {
+    errors.push(`Amount must be at least $${(LIMITS.perTransactionMin / 100).toFixed(2)}`);
   } else if (amount > LIMITS.perTransactionMax) {
-    errors.push(`Amount cannot exceed $${LIMITS.perTransactionMax.toLocaleString()}`);
-  } else if (!Number.isFinite(amount)) {
-    errors.push('Amount must be a valid number');
+    errors.push(`Amount cannot exceed $${(LIMITS.perTransactionMax / 100).toLocaleString()}`);
+  } else if (!Number.isFinite(amount) || amount <= 0) {
+    errors.push('Amount must be a positive number');
   }
-
-  if (currency && typeof currency !== 'string') {
-    errors.push('Currency must be a string');
+  
+  // Validate currency
+  const supportedCurrencies = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY'];
+  if (!supportedCurrencies.includes(currency?.toUpperCase())) {
+    errors.push(`Currency must be one of: ${supportedCurrencies.join(', ')}`);
   }
-
-  const validCurrencies = ['USD', 'CAD', 'EUR', 'GBP', 'JPY', 'AUD'];
-  if (currency && !validCurrencies.includes(currency.toUpperCase())) {
-    errors.push('Unsupported currency');
+  
+  // Validate URLs
+  const urlRegex = /^https?:\/\/[^\s]+$/;
+  if (!successUrl || !urlRegex.test(successUrl)) {
+    errors.push('Valid success URL is required');
   }
-
-  // Validate idempotency key length
-  if (idempotencyKey && idempotencyKey.length > 45) {
-    errors.push('Idempotency key must be 45 characters or less');
+  if (!cancelUrl || !urlRegex.test(cancelUrl)) {
+    errors.push('Valid cancel URL is required');
   }
-
+  
+  // Validate email if provided
+  if (customerEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail)) {
+    errors.push('Invalid email address format');
+  }
+  
+  // Validate mode
+  if (!['payment', 'subscription'].includes(mode)) {
+    errors.push('Mode must be either "payment" or "subscription"');
+  }
+  
   if (errors.length > 0) {
     return res.status(400).json({
       success: false,
@@ -377,306 +454,438 @@ function validatePaymentInput(req, res, next) {
       requestId: req.requestId
     });
   }
-
+  
   next();
 }
 
-// Enhanced Square API test endpoint
-app.get('/api/test', generalLimiter, async (req, res) => {
+// Stripe API test endpoint
+app.get('/api/test', async (req, res) => {
   try {
-    const locationsApi = squareClient.locationsApi;
-    const response = await locationsApi.listLocations();
-
-    if (response.result && response.result.locations) {
-      const testLocation = response.result.locations.find(
-        loc => loc.id === process.env.SQUARE_LOCATION_ID
-      );
-      
-      console.log('Square API test successful:', {
-        requestId: req.requestId,
-        locationFound: !!testLocation,
-        totalLocations: response.result.locations.length
-      });
-      
-      res.json({
-        success: true,
-        message: 'Square API connection successful',
-        environment: process.env.SQUARE_ENVIRONMENT || 'sandbox',
-        locationCount: response.result.locations.length,
-        configuredLocationFound: !!testLocation,
-        timestamp: new Date().toISOString(),
-        requestId: req.requestId
-      });
-    } else {
-      throw new Error('Invalid response from Square API');
-    }
+    // Test Stripe connection by fetching account info
+    const account = await stripeClient.accounts.retrieve();
+    
+    console.log('✅ Stripe API test successful:', {
+      requestId: req.requestId,
+      accountId: account.id,
+      country: account.country,
+      chargesEnabled: account.charges_enabled,
+      payoutsEnabled: account.payouts_enabled
+    });
+    
+    res.json({
+      success: true,
+      message: 'Stripe API connection successful',
+      environment: isProduction ? 'production' : 'development',
+      account: {
+        id: account.id,
+        country: account.country,
+        chargesEnabled: account.charges_enabled,
+        payoutsEnabled: account.payouts_enabled,
+        businessProfile: account.business_profile?.name || 'Not set'
+      },
+      timestamp: new Date().toISOString(),
+      requestId: req.requestId
+    });
   } catch (error) {
-    console.error('Square API test failed:', {
+    console.error('❌ Stripe API test failed:', {
       requestId: req.requestId,
       error: error.message,
-      details: error.errors
+      type: error.type,
+      code: error.code
     });
     
     res.status(500).json({
       success: false,
-      error: 'Square API connection failed',
-      details: isProduction ? 'Internal server error' : error.message,
+      error: 'Stripe API connection failed',
+      details: isProduction ? 'Service temporarily unavailable' : error.message,
+      type: error.type,
       timestamp: new Date().toISOString(),
       requestId: req.requestId
     });
   }
 });
 
-// Enhanced payment processing endpoint with better error handling
-app.post('/api/payments', paymentLimiter, validatePaymentInput, async (req, res) => {
+// Create Checkout Session endpoint
+app.post('/api/create-checkout-session', checkoutLimiter, validateCheckoutInput, async (req, res) => {
   const requestId = req.requestId;
   
   try {
-    // Check transaction limits before processing - but be more lenient
-    const limitCheck = checkTransactionLimits();
+    const {
+      amount,
+      currency = 'USD',
+      successUrl,
+      cancelUrl,
+      customerEmail,
+      lineItems = [],
+      mode = 'payment',
+      customerName,
+      allowPromotionCodes = false,
+      automaticTax = false
+    } = req.body;
+    
+    // Check transaction limits
+    const limitCheck = checkTransactionLimits(amount);
     if (limitCheck.limited) {
-      console.warn('Transaction limit reached:', {
+      console.warn('🚫 Transaction limit reached:', {
         requestId,
         limitType: limitCheck.type,
-        resetTime: limitCheck.resetTime,
-        counters: {
-          daily: transactionMetrics.dailyCount,
-          hourly: transactionMetrics.hourlyCount
-        }
+        resetTime: limitCheck.resetTime
       });
       
       return res.status(429).json({
         success: false,
-        error: 'Transaction limit temporarily reached',
-        details: [{
-          code: 'TRANSACTION_LIMIT',
-          category: 'RATE_LIMIT_ERROR',
-          detail: limitCheck.message,
-          field: 'transaction_count'
-        }],
-        message: limitCheck.message,
+        error: 'Transaction limit reached',
+        details: limitCheck.message,
         resetTime: limitCheck.resetTime,
         requestId
       });
     }
-
-    const { 
-      sourceId, 
-      amount, 
-      currency = 'USD', 
-      idempotencyKey, 
-      buyerEmail,
-      billingAddress,
-      orderDescription 
-    } = req.body;
     
-    const paymentsApi = squareClient.paymentsApi;
-    const amountInCents = Math.round(amount * 100);
-
-    // Generate secure idempotency key if not provided
-    const finalIdempotencyKey = idempotencyKey || 
-      `vb_${Date.now()}_${Math.random().toString(36).substr(2, 10)}`.substr(0, 45);
-
-    // Build request body with proper field length limits
-    const requestBody = {
-      sourceId: sourceId.trim(),
-      amountMoney: {
-        amount: BigInt(amountInCents),
-        currency: currency.toUpperCase()
-      },
-      locationId: process.env.SQUARE_LOCATION_ID,
-      idempotencyKey: finalIdempotencyKey,
-      note: orderDescription ? orderDescription.substr(0, 60) : undefined,
-      buyerEmailAddress: buyerEmail || undefined
-    };
-
-    // Add billing address if provided (with field length validation)
-    if (billingAddress) {
-      requestBody.billingAddress = {
-        firstName: billingAddress.firstName?.substr(0, 45),
-        lastName: billingAddress.lastName?.substr(0, 45),
-        addressLine1: billingAddress.addressLine1?.substr(0, 60),
-        locality: billingAddress.locality?.substr(0, 45),
-        administrativeDistrictLevel1: billingAddress.administrativeDistrictLevel1?.substr(0, 45),
-        postalCode: billingAddress.postalCode?.substr(0, 20),
-        country: billingAddress.country?.substr(0, 2).toUpperCase() || 'US'
-      };
+    // Prepare line items
+    let sessionLineItems;
+    if (lineItems.length > 0) {
+      sessionLineItems = lineItems.map(item => ({
+        price_data: {
+          currency: currency.toLowerCase(),
+          product_data: {
+            name: item.name,
+            description: item.description,
+            images: item.images || []
+          },
+          unit_amount: item.amount,
+        },
+        quantity: item.quantity || 1,
+      }));
+    } else {
+      // Fallback single item
+      sessionLineItems = [{
+        price_data: {
+          currency: currency.toLowerCase(),
+          product_data: {
+            name: 'Purchase',
+            description: 'Payment for services'
+          },
+          unit_amount: amount,
+        },
+        quantity: 1,
+      }];
     }
-
-    console.log('Processing payment:', {
+    
+    // Prepare customer data
+    let customerData = {};
+    if (customerEmail) {
+      customerData.customer_email = customerEmail;
+    }
+    
+    // Create checkout session
+    const sessionParams = {
+      payment_method_types: ['card'],
+      line_items: sessionLineItems,
+      mode,
+      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: cancelUrl,
+      allow_promotion_codes: allowPromotionCodes,
+      billing_address_collection: 'required',
+      shipping_address_collection: {
+        allowed_countries: ['US', 'CA', 'GB', 'AU', 'DE', 'FR', 'IT', 'ES', 'NL'] // Adjust based on your needs
+      },
+      payment_intent_data: {
+        metadata: {
+          requestId,
+          source: 'vibebeads_checkout',
+          timestamp: new Date().toISOString()
+        }
+      },
+      metadata: {
+        requestId,
+        customerName: customerName || '',
+        source: 'vibebeads_checkout'
+      },
+      expires_at: Math.floor(Date.now() / 1000) + (30 * 60), // 30 minutes expiry
+      ...customerData
+    };
+    
+    // Add automatic tax if enabled
+    if (automaticTax) {
+      sessionParams.automatic_tax = { enabled: true };
+    }
+    
+    console.log('💳 Creating Stripe checkout session:', {
       requestId,
       amount,
       currency,
-      locationId: process.env.SQUARE_LOCATION_ID,
-      idempotencyKeyLength: finalIdempotencyKey.length,
-      hasBillingAddress: !!billingAddress,
-      hasOrderDescription: !!orderDescription,
-      counters: {
+      itemCount: sessionLineItems.length,
+      hasCustomerEmail: !!customerEmail,
+      mode
+    });
+    
+    const session = await stripeClient.checkout.sessions.create(sessionParams);
+    
+    // Update transaction counters
+    transactionMetrics.dailyCount++;
+    transactionMetrics.hourlyCount++;
+    transactionMetrics.dailyVolume += (amount / 100);
+    transactionMetrics.monthlyVolume += (amount / 100);
+    
+    console.log('✅ Checkout session created:', {
+      requestId,
+      sessionId: session.id,
+      amount,
+      currency,
+      customerEmail,
+      newCounters: {
         daily: transactionMetrics.dailyCount,
-        hourly: transactionMetrics.hourlyCount
+        hourly: transactionMetrics.hourlyCount,
+        dailyVolume: transactionMetrics.dailyVolume
       }
     });
-
-    const response = await paymentsApi.createPayment(requestBody);
-
-    if (response.result && response.result.payment) {
-      const payment = response.result.payment;
-      
-      // Update transaction counters on successful payment
-      transactionMetrics.dailyCount++;
-      transactionMetrics.hourlyCount++;
-      
-      console.log('Payment successful:', {
-        requestId,
-        paymentId: payment.id,
-        status: payment.status,
-        amount,
-        currency,
-        newCounters: {
-          daily: transactionMetrics.dailyCount,
-          hourly: transactionMetrics.hourlyCount
-        }
-      });
-
-      res.json({
-        success: true,
-        paymentId: payment.id,
-        status: payment.status,
-        amount: amount,
-        currency: currency.toUpperCase(),
-        timestamp: new Date().toISOString(),
-        requestId,
-        receiptUrl: payment.receiptUrl || null
-      });
-    } else {
-      console.error('Payment failed - no payment object:', {
-        requestId,
-        response: response.result
-      });
-      
-      res.status(400).json({
-        success: false,
-        error: 'Payment processing failed',
-        details: 'No payment object returned',
-        requestId
-      });
-    }
+    
+    res.json({
+      success: true,
+      sessionId: session.id,
+      url: session.url,
+      amount,
+      currency: currency.toUpperCase(),
+      expiresAt: new Date(session.expires_at * 1000).toISOString(),
+      timestamp: new Date().toISOString(),
+      requestId
+    });
+    
   } catch (error) {
-    console.error('Payment processing error:', {
+    console.error('❌ Checkout session creation failed:', {
       requestId,
       error: error.message,
-      squareErrors: error.errors,
-      statusCode: error.statusCode
+      type: error.type,
+      code: error.code,
+      stripeRequestId: error.requestId
     });
-
-    // Handle specific Square API errors
-    if (error.errors && Array.isArray(error.errors)) {
-      const errorDetails = error.errors.map(err => ({
-        code: err.code,
-        category: err.category,
-        detail: err.detail,
-        field: err.field
-      }));
-      
-      // Check for Square API rate limit errors (not our internal limits)
-      const hasSquareRateLimit = error.errors.some(err => 
-        err.code?.includes('RATE_LIMIT') ||
-        err.category === 'RATE_LIMIT_ERROR' ||
-        (err.detail?.toLowerCase().includes('rate') && err.detail?.toLowerCase().includes('limit'))
-      );
-      
-      if (hasSquareRateLimit) {
-        console.error('Square API rate limit reached (from Square):', {
-          requestId,
-          errorDetails
-        });
-        
-        return res.status(429).json({
-          success: false,
-          error: 'Square API rate limit reached',
-          details: errorDetails,
-          message: 'Payment processing temporarily limited by Square. Please try again in a few minutes.',
-          requestId
-        });
-      }
-      
-      res.status(400).json({
-        success: false,
-        error: 'Payment failed',
-        details: errorDetails,
-        message: error.errors.map(e => e.detail || e.code).join(', '),
-        requestId
-      });
-    } else {
-      // Handle network or other errors
-      const isNetworkError = error.message?.toLowerCase().includes('network') ||
-                           error.message?.toLowerCase().includes('timeout') ||
-                           error.code === 'ECONNRESET';
-      
-      res.status(isNetworkError ? 503 : 500).json({
-        success: false,
-        error: isNetworkError ? 'Service temporarily unavailable' : 'Payment processing error',
-        details: isProduction ? 'Internal server error' : error.message,
-        requestId
-      });
+    
+    // Handle specific Stripe errors
+    let statusCode = 500;
+    let errorMessage = 'Checkout session creation failed';
+    
+    if (error.type === 'StripeCardError') {
+      statusCode = 400;
+      errorMessage = 'Payment method error';
+    } else if (error.type === 'StripeRateLimitError') {
+      statusCode = 429;
+      errorMessage = 'Rate limit exceeded';
+    } else if (error.type === 'StripeInvalidRequestError') {
+      statusCode = 400;
+      errorMessage = 'Invalid request parameters';
+    } else if (error.type === 'StripeAPIError') {
+      statusCode = 502;
+      errorMessage = 'Stripe API error';
+    } else if (error.type === 'StripeConnectionError') {
+      statusCode = 503;
+      errorMessage = 'Connection error';
     }
+    
+    res.status(statusCode).json({
+      success: false,
+      error: errorMessage,
+      details: isProduction ? 'Please try again later' : error.message,
+      type: error.type,
+      code: error.code,
+      requestId
+    });
   }
 });
 
-// Transaction metrics endpoint
-app.get('/api/metrics', generalLimiter, (req, res) => {
+// Retrieve checkout session endpoint
+app.get('/api/checkout-session/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  const requestId = req.requestId;
+  
+  try {
+    const session = await stripeClient.checkout.sessions.retrieve(sessionId, {
+      expand: ['payment_intent', 'customer']
+    });
+    
+    console.log('📋 Checkout session retrieved:', {
+      requestId,
+      sessionId,
+      status: session.status,
+      paymentStatus: session.payment_status
+    });
+    
+    res.json({
+      success: true,
+      session: {
+        id: session.id,
+        status: session.status,
+        paymentStatus: session.payment_status,
+        customerEmail: session.customer_details?.email,
+        amountTotal: session.amount_total,
+        currency: session.currency,
+        paymentIntentId: session.payment_intent?.id,
+        created: new Date(session.created * 1000).toISOString()
+      },
+      requestId
+    });
+    
+  } catch (error) {
+    console.error('❌ Session retrieval failed:', {
+      requestId,
+      sessionId,
+      error: error.message,
+      type: error.type
+    });
+    
+    const statusCode = error.type === 'StripeInvalidRequestError' ? 404 : 500;
+    res.status(statusCode).json({
+      success: false,
+      error: 'Session retrieval failed',
+      details: isProduction ? 'Session not found or expired' : error.message,
+      requestId
+    });
+  }
+});
+
+// Webhook endpoint for Stripe events
+app.post('/api/webhook', webhookLimiter, async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const requestId = req.requestId;
+  let event;
+  
+  try {
+    event = stripeClient.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('❌ Webhook signature verification failed:', {
+      requestId,
+      error: err.message
+    });
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  
+  console.log('📨 Webhook received:', {
+    requestId,
+    type: event.type,
+    id: event.id,
+    created: new Date(event.created * 1000).toISOString()
+  });
+  
+  // Handle the event
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed':
+        const session = event.data.object;
+        console.log('✅ Payment successful:', {
+          sessionId: session.id,
+          amount: session.amount_total,
+          currency: session.currency,
+          customerEmail: session.customer_details?.email,
+          paymentIntentId: session.payment_intent
+        });
+        
+        // TODO: Fulfill order, send confirmation email, update database
+        await handleSuccessfulPayment(session);
+        break;
+        
+      case 'checkout.session.expired':
+        const expiredSession = event.data.object;
+        console.log('⏰ Checkout session expired:', {
+          sessionId: expiredSession.id,
+          amount: expiredSession.amount_total
+        });
+        break;
+        
+      case 'payment_intent.payment_failed':
+        const failedPaymentIntent = event.data.object;
+        console.log('❌ Payment failed:', {
+          paymentIntentId: failedPaymentIntent.id,
+          amount: failedPaymentIntent.amount,
+          lastPaymentError: failedPaymentIntent.last_payment_error?.message
+        });
+        break;
+        
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
+    }
+    
+    res.json({ received: true, requestId });
+    
+  } catch (error) {
+    console.error('❌ Webhook processing error:', {
+      requestId,
+      eventType: event.type,
+      eventId: event.id,
+      error: error.message
+    });
+    res.status(500).json({ error: 'Webhook processing failed', requestId });
+  }
+});
+
+// Handle successful payment (customize based on your needs)
+async function handleSuccessfulPayment(session) {
+  try {
+    // Extract order details from session metadata
+    const orderDetails = {
+      sessionId: session.id,
+      paymentIntentId: session.payment_intent,
+      amount: session.amount_total,
+      currency: session.currency,
+      customerEmail: session.customer_details?.email,
+      customerName: session.customer_details?.name,
+      shippingAddress: session.shipping_details?.address,
+      timestamp: new Date().toISOString()
+    };
+    
+    console.log('📦 Processing successful order:', orderDetails);
+    
+    // TODO: Implement your order fulfillment logic here:
+    // - Save order to database
+    // - Update inventory
+    // - Send confirmation email
+    // - Trigger shipping process
+    // - Send webhook to other services
+    
+    return orderDetails;
+  } catch (error) {
+    console.error('❌ Order fulfillment error:', error.message);
+    throw error;
+  }
+}
+
+// Metrics endpoint
+app.get('/api/metrics', (req, res) => {
   resetTransactionCounters();
   
   res.json({
     success: true,
     metrics: {
-      ...transactionMetrics,
-      limits: LIMITS,
-      environment: isProduction ? 'production' : 'development',
-      timestamp: new Date().toISOString()
+      transactions: {
+        daily: transactionMetrics.dailyCount,
+        hourly: transactionMetrics.hourlyCount,
+        limits: {
+          dailyMax: LIMITS.dailyTransactions,
+          hourlyMax: LIMITS.hourlyTransactions
+        }
+      },
+      volume: {
+        daily: transactionMetrics.dailyVolume,
+        monthly: transactionMetrics.monthlyVolume,
+        limits: {
+          dailyMax: LIMITS.dailyVolume,
+          monthlyMax: LIMITS.monthlyVolume
+        }
+      },
+      system: {
+        environment: isProduction ? 'production' : 'development',
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        timestamp: new Date().toISOString()
+      }
     },
     requestId: req.requestId
   });
 });
 
-// Reset limits endpoint (for development/testing)
-app.post('/api/reset-limits', (req, res) => {
-  if (isProduction) {
-    return res.status(403).json({
-      success: false,
-      error: 'Reset not allowed in production',
-      requestId: req.requestId
-    });
-  }
-  
-  // Reset all counters and limits
-  transactionMetrics = {
-    dailyCount: 0,
-    hourlyCount: 0,
-    lastHourlyReset: new Date().getHours(),
-    lastDailyReset: new Date().toDateString(),
-    limitReached: false,
-    limitType: null,
-    limitResetTime: null
-  };
-  
-  console.log('Transaction limits reset:', {
-    requestId: req.requestId,
-    timestamp: new Date().toISOString()
-  });
-  
-  res.json({
-    success: true,
-    message: 'Transaction limits reset',
-    requestId: req.requestId
-  });
-});
-
-// Enhanced error handling middleware
+// Error handling middleware
 app.use((err, req, res, next) => {
-  const errorId = `err_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const errorId = `err_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
   
-  console.error('Unhandled error:', {
+  console.error('🔥 Unhandled error:', {
     errorId,
     requestId: req.requestId,
     error: err.message,
@@ -699,64 +908,108 @@ app.use((err, req, res, next) => {
 app.use('*', (req, res) => {
   res.status(404).json({
     success: false,
-    error: 'Route not found',
-    availableRoutes: ['/health', '/api/config', '/api/test', '/api/payments', '/api/metrics'],
+    error: 'Endpoint not found',
+    availableEndpoints: [
+      'GET /health',
+      'GET /api/config',
+      'GET /api/test',
+      'POST /api/create-checkout-session',
+      'GET /api/checkout-session/:sessionId',
+      'POST /api/webhook',
+      'GET /api/metrics'
+    ],
     requestId: req.requestId
   });
 });
 
-// Enhanced process handlers
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
+// Graceful shutdown handling
+const shutdown = (signal) => {
+  console.log(`\n🛑 ${signal} received, starting graceful shutdown...`);
+  
+  server.close((err) => {
+    if (err) {
+      console.error('❌ Error during server shutdown:', err);
+      process.exit(1);
+    }
+    
+    console.log('✅ Server closed successfully');
+    
+    // Close database connections, cleanup resources, etc.
+    setTimeout(() => {
+      console.log('✅ Graceful shutdown completed');
+      process.exit(0);
+    }, 1000);
   });
-});
+  
+  // Force shutdown after 30 seconds
+  setTimeout(() => {
+    console.error('❌ Forced shutdown after 30s timeout');
+    process.exit(1);
+  }, 30000);
+};
 
-process.on('SIGINT', () => {
-  console.log('SIGINT received, shutting down gracefully');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
-});
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection:', {
-    reason,
-    promise,
-    timestamp: new Date().toISOString()
-  });
-});
-
+// Handle uncaught exceptions and unhandled rejections
 process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', {
+  console.error('🔥 Uncaught Exception:', {
     error: error.message,
     stack: error.stack,
     timestamp: new Date().toISOString()
   });
-  process.exit(1);
+  
+  if (isProduction) {
+    // In production, attempt graceful shutdown
+    shutdown('UNCAUGHT_EXCEPTION');
+  } else {
+    process.exit(1);
+  }
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('🔥 Unhandled Rejection:', {
+    reason: reason?.message || reason,
+    promise,
+    timestamp: new Date().toISOString()
+  });
+  
+  if (isProduction) {
+    // In production, log but don't crash
+    console.error('⚠️ Continuing execution in production mode');
+  } else {
+    process.exit(1);
+  }
 });
 
 // Start server
 const server = app.listen(PORT, () => {
-  console.log('Server started:', {
+  console.log('🚀 Stripe Payment Server Started:', {
     port: PORT,
-    environment: process.env.SQUARE_ENVIRONMENT || 'sandbox',
-    nodeEnv: process.env.NODE_ENV || 'development',
-    limits: isProduction ? 'Production limits active' : 'Development limits (relaxed)',
-    timestamp: new Date().toISOString()
+    environment: isProduction ? 'production' : 'development',
+    nodeVersion: process.version,
+    stripeApiVersion: '2023-10-16',
+    timestamp: new Date().toISOString(),
+    processId: process.pid
   });
+  
+  // Test Stripe connection on startup
+  stripeClient.accounts.retrieve()
+    .then(account => {
+      console.log('✅ Stripe connection verified:', {
+        accountId: account.id,
+        country: account.country,
+        chargesEnabled: account.charges_enabled
+      });
+    })
+    .catch(error => {
+      console.error('❌ Stripe connection failed on startup:', error.message);
+    });
 });
 
-server.on('close', () => {
-  console.log('Server closed at:', new Date().toISOString());
-});
-
-// Graceful shutdown timeout
-server.on('connection', (socket) => {
-  socket.setTimeout(30000); // 30 second timeout
-});
+// Server timeout and keep-alive settings
+server.keepAliveTimeout = 65000; // 65 seconds
+server.headersTimeout = 66000; // 66 seconds
+server.timeout = 120000; // 2 minutes
 
 module.exports = app;
